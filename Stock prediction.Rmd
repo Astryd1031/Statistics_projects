@@ -1,0 +1,189 @@
+library(readr)
+library(tidyr)
+library(dplyr)
+library(MASS)
+library(car)
+library(leaps)
+library(glmnet)
+library(caret)
+# ------- DATA CLEANING AND PREPROCESSING ------
+dir_list <- c("./data/SP500.csv",
+              "./data/InflationRate.csv",
+              "./data/M2.csv",
+              "./data/Maturity10-2Y.csv",
+              "./data/Maturity10Y.csv",
+              "./data/Presidents.csv")
+
+# all dates starts a little bit early as some of the forwards are from 
+# earlier dates
+all_dates_uncleaned <- seq(as.Date("2015-01-01"), as.Date("2024-12-31"), 
+                           by="day")
+
+all_data <- data.frame(Date = all_dates_uncleaned)
+
+for (i in seq_along(dir_list)){
+  if (i!=6){
+    dummy <- read_csv(dir_list[i]) %>%
+      rename(Date = observation_date) %>%
+      mutate(Date = as.Date(Date))
+  } else{
+    dummy <- read_csv(dir_list[i]) %>%
+      rename(Date = InaugurationDate) %>%
+      mutate(Date = as.Date(Date))
+  }
+  
+  
+  all_data <- left_join(all_data, dummy, by = "Date")
+  
+  if (i>1){ # first one is the independent variable, we don't forward fill
+    all_data <- all_data %>%
+      arrange(Date) %>%
+      fill(-Date, .direction = "down")
+  }
+}
+
+# clean all non-observed SP500
+all_data <- all_data[!(is.na(all_data[["SP500"]])), ]
+
+# ----- DATA SCATTERPLOT AND VISUALIZATION -----
+plot(all_data, pch = 18)
+
+all_data$Date <- as.Date(all_data$Date)
+
+View(summary(all_data))
+
+
+# ----- PRELIMINARY ANALYSIS -----
+#Linear Regression
+model <- lm(SP500 ~ T10YIE + WM2NS + T10Y2Y + DGS10 + President, 
+            data = all_data)
+
+View(summary(model))
+
+#plot the model
+all_data$fitted <- predict(model, newdata = all_data)
+
+#plot of fitted valuess against actual values for S&P 500
+plot(all_data$Date, all_data$fitted, type = "l", col = "blue",
+     xlab = "Date", ylab = "S&P 500 Closing Values", 
+     main = "Fitted (Blue) vs Actual (Red) S&P 500 Values") 
+
+points(all_data$Date, all_data$SP500, col = "red", pch = 16)
+
+#LINEARITY ASSUMPTIONS CHECKING -----
+#plot(model)
+
+# ----- MODEL TRANSFORMATION -----
+
+# Preparing data for Box-Cox transformation
+all_data[] <- lapply(all_data, function(x) {
+  if (is.numeric(x)) {
+    # Shift negative values to be positive
+    if (any(x <= 0)) x <- x + 1 - min(x)
+  }
+  return(x)
+})
+
+# Apply and plot the Box-Cox transformation
+boxcox_result <- boxcox(model, lambda = seq(-2, 2, 0.1))
+
+# Add the main title after plotting
+title("Box-Cox Transformation Plot")
+
+# Mark the optimal lambda on the plot
+abline(v = optimal_lambda, col = "red", lty = 2)
+text(optimal_lambda, max(boxcox_result$y), labels = round(optimal_lambda, 3), pos = 4)
+
+# Extract the optimal lambda
+optimal_lambda <- boxcox_result$x[which.max(boxcox_result$y)]
+print(paste("Optimal Lambda:", optimal_lambda))
+
+# Apply the Box-Cox transformation to the dependent variable (SP500)
+if (optimal_lambda == 0) {
+  all_data$SP500 <- log(all_data$SP500)
+} else {
+  all_data$SP500 <- (all_data$SP500^optimal_lambda - 1) / optimal_lambda
+}
+
+# Fit the model with the Box-Cox transformed variable
+modelpre<- lm(SP500 ~ poly(T10YIE, 3.2) + WM2NS + poly(T10Y2Y,4.5) + poly(DGS10,2.1), data = all_data)
+
+#REMOVING OUTLIERS AND LEVERAGE POINTS -----
+
+# Calculate leverage values
+leverage_values <- hatvalues(modelpre)
+# Determine threshold for high leverage
+threshold <- 2 * (length(coef(modelpre)) / nrow(all_data))
+
+# Filter out high leverage points
+all_data_filtered <- all_data[leverage_values < threshold, ]
+
+# TRANSFORMED MODEL -----
+model<- lm(SP500 ~ poly(T10YIE, 3.2)  + WM2NS +  poly(T10Y2Y, 4.5) + poly(DGS10,2.1), data = all_data_filtered)
+
+# Check for multicollinearity
+summary(model)
+vif(model_transformed)
+
+#plot the model
+all_data$fitted <- predict(model, newdata = all_data)
+
+#plot of fitted valuess against actual values for S&P 500
+plot(all_data$Date, all_data$fitted, type = "l", col = "blue",
+     xlab = "Date", ylab = "S&P 500 Closing Values", 
+     main = "Fitted (Blue) vs Actual (Red) S&P 500 Values") 
+
+points(all_data$Date, all_data$SP500, col = "red", pch = 16)
+
+
+# Get the summary of the model
+model_summary <- summary(model)
+
+# Extract the R-squared
+r_squared <- model_summary$r.squared
+print(paste("R-squared:", r_squared))
+
+# Calculate AIC
+model_aic <- AIC(model_transformed)
+print(paste("AIC:", model_aic))
+
+# Calculate BIC
+model_bic <- BIC(model_transformed)
+print(paste("BIC:", model_bic))
+
+reg_fit <- regsubsets(SP500 ~ poly(T10YIE, 3.2) + WM2NS + poly(T10Y2Y, 4.5) + poly(DGS10, 2.1), 
+                       data = all_data_filtered, 
+                       nvmax = 10, nbest =1 , really.big=TRUE, method="seqrep")  # nvmax is the max number of variables to consider
+
+# Summary of the best subset selection
+reg_summary <- summary(reg_fit)
+print(reg_summary)
+# View metrics
+print(reg_summary$adjr2)    # Adjusted R²
+print(reg_summary$bic)      # BIC
+print(reg_summary$cp)   
+# Plot metrics to visualize the best model
+par(mfrow = c(1, 1))  # Single plot
+par(mar = c(5, 4, 4, 2) + 0.1)  # Adjust margins
+plot(reg_fit, scale = "adjr2")  # Adjusted R²
+plot(reg_fit, scale = "bic")    # BIC
+
+# ----- LINEARITY ASSUMPTIONS CHECKING -----
+plot(model_transformed)
+
+
+#FURTHER VALIDATION : 10-fold CROSS VALIDATION -----
+# Create a control function for cross-validation
+train_control <- trainControl(method = "cv", number = 10)
+
+# Fit the model using caret::train
+cv_model <- train(
+  SP500 ~ poly(T10YIE, 3.2) + WM2NS + poly(T10Y2Y, 4.5) + poly(DGS10, 2.1),
+  data = all_data_filtered,
+  method = "lm",
+  trControl = train_control
+)
+
+# Print CV results
+print(cv_model)
+
